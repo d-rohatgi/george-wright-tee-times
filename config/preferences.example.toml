@@ -1,0 +1,48 @@
+# Booking rules. Task code reads these — never hardcode a preference in Python.
+#
+# Copy this file to config/preferences.toml and fill in [george_wright.account].
+# preferences.toml is gitignored: your account details never enter the repo.
+
+[george_wright]
+# Must match courseName from the API exactly — the live sheet returns
+# "George Wright Golf Course", not "George Wright". courseIds=2 already
+# scopes the query; this is the belt-and-braces check.
+course = "George Wright Golf Course"
+players = 4        # 1–4; a slot needs this many open seats to qualify
+holes = 18         # 9 or 18
+
+# "Prefer the earliest available time" is the ranking rule — it applies inside
+# this window. The agent takes the slot closest to no_earlier_than, and never
+# books outside the window even if something else is free.
+no_earlier_than = "10:00"
+no_later_than = "14:00"
+
+# How far down the ranked list to walk when the top choice gets sniped.
+# Each failed attempt costs one HTTP round trip (~150ms) because LockTeeTimes
+# rejects immediately — so a deeper walk is cheap. 3 is too shallow for a 7am
+# rush on a popular Saturday.
+max_attempts = 6
+
+# How long to keep polling before declaring failure. The scheduled job starts
+# at 06:58, so this must cover the gap to 07:00 plus the rush — 90 would give
+# up ninety seconds BEFORE inventory drops.
+deadline_seconds = 300
+poll_interval_seconds = 0.5
+
+
+# Account lookup keys. Nothing here is a credential:
+#   password   -> macOS Keychain (service "georgewright-cps", account = email)
+#   card token -> fetched per booking, held in memory, never written down
+#
+# Fill in email first, store the password in Keychain, then run
+#   python3 -m booking_agent.cli whoami
+# It lists your saved cards (id, last 4, acct) and your member class — copy
+# them here. card_id and card_last4 must BOTH match or the adapter refuses to
+# book: two cards on one account can share the same last four digits.
+[george_wright.account]
+email = "you@example.com"
+acct = "000000"           # the "acct" column from whoami, for your card
+card_id = 0               # the "id" column from whoami
+card_last4 = "0000"
+member_class = "NRES"     # "member class" from whoami; NRES = non-resident
+rate_code = "NON-RES"     # NON-RES pairs with NRES; residents: see README

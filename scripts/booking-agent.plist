@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tuesday 06:58 run. Install:
+
+    cp scripts/local.booking-agent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/local.booking-agent.plist
+
+  This alone is NOT enough. A sleeping Mac runs it late, which for a 07:00:00
+  release is the same as not running it. Pair with a scheduled wake:
+
+    sudo pmset repeat wake MTWRFSU 06:55:00
+
+  and leave the machine on AC power. On battery with the lid closed, Apple
+  Silicon sleeps too deeply for the wake to be dependable.
+
+  Starting at 06:58 means deadline_seconds in preferences.toml must be at
+  least 240 — otherwise the poll loop gives up before inventory drops.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.booking-agent</string>
+
+    <!--
+      MUST be the Homebrew 3.14, not /usr/bin/python3. The system python is
+      3.9.6 and has no tomllib, so config loading dies on import and the run
+      fails before it does anything. launchd gives you a minimal environment,
+      so every path here is absolute on purpose.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/python@3.14/bin/python3.14</string>
+        <string>-m</string>
+        <string>booking_agent.cli</string>
+        <string>--backend</string>
+        <string>live</string>
+        <string>--login</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/you/Desktop/booking-agent</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>2</integer>  <!-- Tuesday -->
+        <key>Hour</key><integer>6</integer>
+        <key>Minute</key><integer>58</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/you/Desktop/booking-agent/data/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/you/Desktop/booking-agent/data/launchd.err</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

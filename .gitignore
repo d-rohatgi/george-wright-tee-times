@@ -1,0 +1,10 @@
+.DS_Store
+data/
+__pycache__/
+*.pyc
+.env
+.venv/
+state/
+*.db
+*.har
+docs/*.har
