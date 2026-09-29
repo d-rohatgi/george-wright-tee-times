@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Tuesday 06:58 run. Install:
+  Tue–Fri 06:58 run (see StartCalendarInterval below). Install:
 
     cp scripts/local.booking-agent.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/local.booking-agent.plist
@@ -41,12 +41,17 @@
     <key>WorkingDirectory</key>
     <string>/Users/you/Desktop/booking-agent</string>
 
+    <!-- Tue–Fri 06:58. Tuesday hits the normal 07:00 release for prime slots;
+         Wed–Fri are idempotent no-ops once booked, but catch a holiday-shifted
+         release (e.g. Labor Day) that a Tuesday-only run would miss entirely.
+         Monday is skipped — the target Saturday isn't in the 4-day window yet. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Weekday</key><integer>2</integer>  <!-- Tuesday -->
-        <key>Hour</key><integer>6</integer>
-        <key>Minute</key><integer>58</integer>
-    </dict>
+    <array>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>58</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>58</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>58</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>58</integer></dict>
+    </array>
 
     <key>StandardOutPath</key>
     <string>/Users/you/Desktop/booking-agent/data/launchd.log</string>

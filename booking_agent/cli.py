@@ -51,14 +51,11 @@ def _adapter(args):
 def _target(args, adapter) -> date:
     if args.date:
         return date.fromisoformat(args.date)
-    if args.backend == "live":
-        # Ask the server how far ahead it will let us book rather than
-        # assuming Tuesday+4. If the course moves the window, we follow.
-        try:
-            return adapter.target_date()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[warn] booking_rules unavailable ({exc}); "
-                  f"falling back to next Saturday")
+    # Always target the upcoming Saturday. The job runs Tue–Fri (not Tuesday
+    # only), so a holiday-shifted release — like Labor Day pushing the Sep 12
+    # sheet past the Tuesday 07:00 window — gets caught the next morning
+    # instead of missed. The ledger's idempotency guard makes every run after
+    # the booking a no-op, so retrying daily costs nothing.
     return golf.next_saturday(date.today())
 
 
