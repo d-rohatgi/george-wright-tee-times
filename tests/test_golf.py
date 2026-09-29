@@ -210,7 +210,14 @@ class TestConfigMatchesReality(unittest.TestCase):
         from booking_agent import config
         from booking_agent.adapters import fake_golf
 
-        self.assertEqual(config.golf_prefs().course, fake_golf._COURSE)
+        # The tracked example is what every setup starts from; the personal
+        # preferences.toml (gitignored) is checked too when present.
+        example = config.DEFAULT_PATH.with_name("preferences.example.toml")
+        for path in (example, config.DEFAULT_PATH):
+            if path.exists():
+                with self.subTest(path=path.name):
+                    prefs = config.golf_prefs(config.load(path))
+                    self.assertEqual(prefs.course, fake_golf._COURSE)
 
 
 class TestBookingReportsRealTeeTime(unittest.TestCase):

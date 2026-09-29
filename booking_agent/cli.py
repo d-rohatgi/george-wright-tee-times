@@ -142,6 +142,13 @@ def cmd_whoami(args) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"golferId     FAILED — {exc}")
         return 1
+    print(f"member class {adapter.member_class_code()}  (config: {ident.member_class})")
+    # Tokens are never shown — only the lookup keys preferences.toml needs.
+    print("saved cards  id        last4  type        expires  acct")
+    for c in adapter.saved_cards():
+        mark = "→" if c["id"] == ident.card_id else " "
+        print(f"           {mark} {c['id']!s:<9} {c['last4']:<6} {c['type']!s:<11} "
+              f"{c['expires']!s:<8} {c['acct']}{'  (default)' if c['default'] else ''}")
     try:
         token = adapter.resolve_card_token()
         print(f"card         id {ident.card_id} ending {ident.card_last4} "
@@ -197,11 +204,12 @@ def cmd_preflight(args) -> int:
     checks.append((wake, f"pmset backup wake scheduled  ({'yes' if wake else 'no'})"))
 
     # launchd job loaded
-    loaded = "local.booking-agent" in sh(["launchctl", "list"])
+    loaded = any(line.split()[-1].endswith("booking-agent")
+                 for line in sh(["launchctl", "list"]).splitlines() if line.split())
     checks.append((loaded, f"launchd job loaded  ({'yes' if loaded else 'NO — load the plist'})"))
 
     # lid: can't read reliably; remind
-    checks.append((True, "lid must be OPEN Monday night (closing forces sleep)"))
+    checks.append((True, "laptops: keep the lid OPEN overnight (closing forces sleep)"))
 
     # auth + card + account, and no stale ledger entry for the target
     ledger = Ledger(_ledger_path("live"))
@@ -289,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="command", required=True)
 
     r = sub.add_parser("run", help="book the next available Saturday tee time")
-    r.add_argument("--date", help="YYYY-MM-DD; defaults to the server's window")
+    r.add_argument("--date", help="YYYY-MM-DD; defaults to the upcoming Saturday")
     r.add_argument("--dry-run", action="store_true", help="rank but never book")
     r.add_argument("--brief", action="store_true", help="run the Phase B model")
     r.add_argument("--quiet", action="store_true", help="no desktop notification")

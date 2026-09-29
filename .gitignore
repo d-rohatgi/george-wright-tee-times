@@ -8,3 +8,6 @@ state/
 *.db
 *.har
 docs/*.har
+
+# Personal account config — copy config/preferences.example.toml
+config/preferences.toml

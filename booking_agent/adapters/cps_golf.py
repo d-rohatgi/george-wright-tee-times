@@ -61,8 +61,8 @@ class Identity:
 
     Note what is *not* here: no password (Keychain), no card token (fetched
     per-booking and held in memory only). `card_id` and `card_last4` are just
-    lookup keys — an account can hold two cards sharing a last-4, so both are
-    required and must agree before anything is charged.
+    lookup keys — an account can hold two cards sharing a last-4, so both
+    are required and must agree before anything is charged.
     """
 
     email: str
@@ -219,6 +219,41 @@ class CPSGolfAdapter:
             self.identity.golfer_id = int(info["golferId"])
         return self.identity.golfer_id
 
+    def member_class_code(self) -> str:
+        """The account's member class as the server sees it (e.g. NRES)."""
+        self._require_auth()
+        code = self._get("/GetUserInformation").get("memberClassCode", "")
+        if isinstance(code, dict):  # the live API nests the whole class record
+            code = code.get("class", "")
+        return str(code)
+
+    def _cards(self) -> list[dict]:
+        self._require_auth()
+        cards = self._get("/GetAllCreditCardOnFile")
+        if isinstance(cards, dict):
+            cards = cards.get("data") or cards.get("items") or []
+        return cards
+
+    @staticmethod
+    def _last4(card: dict) -> str:
+        masked = str(card.get("ccMaskedNumber", ""))
+        return "".join(ch for ch in masked if ch.isdigit())[-4:]
+
+    def saved_cards(self) -> list[dict]:
+        """Cards on file WITHOUT their tokens — the lookup keys a new user
+        copies into preferences.toml (card_id, card_last4, acct)."""
+        return [
+            {
+                "id": c.get("id"),
+                "last4": self._last4(c),
+                "type": c.get("cardType"),
+                "expires": c.get("cardExpire"),
+                "default": bool(c.get("isDefault")),
+                "acct": c.get("acct"),
+            }
+            for c in self._cards()
+        ]
+
     def resolve_card(self) -> dict:
         """Look up the saved card by id, assert its last 4, return the token.
 
@@ -226,22 +261,19 @@ class CPSGolfAdapter:
         duration of the request — never written to disk or config. Config
         stores the non-sensitive card id and last 4 only.
         """
-        self._require_auth()
-        cards = self._get("/GetAllCreditCardOnFile")
-        if isinstance(cards, dict):
-            cards = cards.get("data") or cards.get("items") or []
-
+        cards = self._cards()
         want_id = self.identity.card_id
         match = next((c for c in cards if c.get("id") == want_id), None)
         if match is None:
-            available = sorted(c.get("id") for c in cards if c.get("id"))
+            available = ", ".join(
+                f"{c.get('id')} (…{self._last4(c)})" for c in cards if c.get("id")
+            )
             raise AdapterError(
-                f"card id {want_id} is no longer on file (available: {available}). "
+                f"card id {want_id} is not on file (available: {available or 'none'}). "
                 "Re-check config/preferences.toml."
             )
 
-        masked = str(match.get("ccMaskedNumber", ""))
-        last4 = "".join(ch for ch in masked if ch.isdigit())[-4:]
+        last4 = self._last4(match)
         if last4 != str(self.identity.card_last4):
             # Refuse rather than silently charge a different card. Two cards on
             # one account can share a last-4, so id and last-4 must agree.

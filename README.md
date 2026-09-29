@@ -1,158 +1,292 @@
 # booking-agent
 
-Books George Wright tee times. Release is Tuesday 07:00 for the following
-Saturday — confirmed from the server, not assumed.
+Automatically books a Saturday tee time at **George Wright Golf Course**
+(Boston) the moment the tee sheet opens.
 
-Zero dependencies, stdlib only. **No model in the loop** — that's opt-in later.
+George Wright releases each date **4 days ahead at 07:00** — so Tuesday 07:00
+opens the following Saturday. This agent is scheduled on your Mac for 06:58,
+polls until inventory drops, grabs the earliest slot inside your time window,
+and sends you a notification with the result. It reads the release rule from
+the course's server rather than assuming it.
 
-```bash
-python3 -m unittest discover -s tests -v          # 16 tests, ~20ms
-python3 -m booking_agent.cli rules                # server's booking window
-python3 -m booking_agent.cli --backend live peek  # today's bookable sheet
-python3 -m booking_agent.cli --backend live run --dry-run
-python3 -m booking_agent.cli simulate             # rehearse the 7am race
-python3 -m booking_agent.cli history
-```
+- **macOS only** — it uses Keychain, launchd, and macOS notifications.
+- **Python 3.11+, standard library only.** No `pip install`.
+- **Your own account.** It books with your City of Boston golf (CPS Golf)
+  login and a card you've already saved on that account.
 
-Default backend is `fake`. `--backend live` hits the real CPS API.
+---
 
-## Status
+## Setup
 
-| | |
-|---|---|
-| Read path (search, booking rules) | **working, live, no browser needed** |
-| Ranking, idempotency, polling, reporting | **done, 16 tests** |
-| Auth, card resolution, cancel, list bookings | **working, verified live** |
-| `book_tee_time` | **working** — booked + cancelled a test reservation on 2026-08-10 |
-| Phase B model summary | written, dormant behind `--brief` |
-| Scheduling (launchd) | plist written, not installed |
-
-> Verified with 2 players / 18 holes, the only shape available in the booking
-> window at the time. The 4-player path uses the same seat logic driven by
-> `availableParticipantNo`, but has not itself been executed.
-
-Before anything authenticated works, seed the Keychain (the `-w` prompt keeps
-it out of shell history):
+### 1. Check Python
 
 ```bash
-security add-generic-password -a you@example.com -s georgewright-cps -w
+python3 --version        # needs 3.11 or newer
 ```
 
-Then verify without booking anything:
+The Python that ships with macOS is 3.9 and **will not work** (it has no
+`tomllib`). If yours is older, install a current one:
+
+```bash
+brew install python@3.12
+```
+
+Every command below uses `python3` — make sure it points at 3.11+.
+
+### 2. Get the code and run the tests
+
+```bash
+git clone <this repo> booking-agent
+cd booking-agent
+python3 -m unittest discover -s tests      # offline, ~1s
+```
+
+The tests use a fake George Wright, so they need no account or network.
+
+### 3. Have a golf account with a saved card
+
+You need an online account on Boston's golf booking site (the one George
+Wright's "Book a tee time" link goes to) with **at least one credit card saved**.
+The easiest way to save a card is to make one booking by hand on the website.
+
+The card is held against no-shows; the green fee is paid at the course.
+
+### 4. Create your config
+
+```bash
+cp config/preferences.example.toml config/preferences.toml
+```
+
+Open `config/preferences.toml` and set `email` to your golf account email.
+Leave the other account fields for now. `preferences.toml` is gitignored — your
+details never enter the repo.
+
+### 5. Store your password in Keychain
+
+```bash
+security add-generic-password -a "you@example.com" -s georgewright-cps -w
+```
+
+Use your golf account email for `-a`. The `-w` flag prompts for the password,
+which keeps it out of your shell history. The password is only ever read from
+Keychain — it is never written to a file.
+
+### 6. Fill in your card with `whoami`
 
 ```bash
 python3 -m booking_agent.cli whoami
 ```
 
-## Booking is a hold-then-confirm flow
+This signs in and lists what the config needs (card tokens are never shown):
 
 ```
-POST /LockTeeTimes            ← the 07:00:00 race is won HERE, ~10 min hold
-POST /CheckRestrictReservation
-POST /TeeTimePricesCalculation   bookingList: one entry per player, holes
-POST /RegisterTransactionId   x2
-POST /ReserveTeeTimes         → reservationId, bookingIds
+member class NRES  (config: NRES)
+saved cards  id        last4  type        expires  acct
+             111111    1234   Visa        0128     22222222  (default)
+card         FAILED — card id 0 is not on file ...
 ```
 
-The hot path is only `search → lock`. Everything after runs inside the hold, at
-a relaxed pace. `UnLockTeeTimes` fires on any abort so a failed run doesn't sit
-on a slot for ten minutes.
+Copy into `[george_wright.account]`:
 
-**`LockTeeTimes` reports failure as `{"error": "..."}` in a 200 response**, not
-an HTTP error status. Checking the status code alone would silently "succeed"
-on a lost slot and fail confusingly three calls later.
+| config field   | from `whoami`                  |
+|----------------|--------------------------------|
+| `card_id`      | the `id` of the card to use    |
+| `card_last4`   | its `last4`                    |
+| `acct`         | its `acct`                     |
+| `member_class` | `member class`                 |
 
-## Credentials
+Run `whoami` again — it should end with `token resolved` and a count of your
+upcoming reservations.
 
-Nothing sensitive is in this repo.
+> **Rate code:** `NRES` (non-resident) pairs with `rate_code = "NON-RES"`, and
+> that is the combination this has been verified with. If you're a Boston
+> resident your member class will differ; check the rate the website shows you
+> at checkout and set `rate_code` to match.
+
+### 7. Set your preferences
+
+Still in `config/preferences.toml`:
+
+| setting | default | meaning |
+|---|---|---|
+| `players` | `4` | seats to book; a slot needs this many open |
+| `holes` | `18` | `9` or `18` |
+| `no_earlier_than` / `no_later_than` | `10:00` / `14:00` | only book inside this window; earliest wins |
+| `max_attempts` | `6` | how many slots to try if the first gets taken |
+| `deadline_seconds` | `300` | how long to keep polling (must be ≥ 240 for a 06:58 start) |
+
+### 8. Try it without booking
+
+```bash
+python3 -m booking_agent.cli rules                   # the server's booking window
+python3 -m booking_agent.cli --backend live peek     # upcoming Saturday's tee sheet (--date for another day)
+python3 -m booking_agent.cli --backend live --login run --dry-run --date YYYY-MM-DD
+```
+
+`--dry-run` ranks the sheet and tells you what it *would* book — nothing is
+reserved. Pick a `--date` that's already open (today through 4 days out);
+on an unreleased date it just polls until `deadline_seconds` runs out.
+
+### 9. Schedule it
+
+The run needs to fire at 06:58 **with the Mac awake**. A job that runs late
+misses the 07:00 rush just as surely as one that never runs.
+
+**Install the launchd job** (from the repo folder):
+
+```bash
+mkdir -p data
+PY="$(command -v python3)"; "$PY" -c "import tomllib" && echo "using $PY"
+sed -e "s|__PYTHON__|$PY|g" -e "s|__REPO_DIR__|$PWD|g" \
+    scripts/booking-agent.plist > ~/Library/LaunchAgents/local.booking-agent.plist
+launchctl load ~/Library/LaunchAgents/local.booking-agent.plist
+```
+
+**Keep the Mac awake and plugged in.** In System Settings, stop the computer
+sleeping automatically when on power, or run:
+
+```bash
+sudo pmset -c sleep 0                        # never idle-sleep on AC power
+sudo pmset repeat wake MTWRFSU 06:55:00      # backup: scheduled wake each morning
+```
+
+On a laptop, leave the lid **open** overnight — closing it forces sleep.
+
+**Check it's ready** — the evening before, or any time:
+
+```bash
+python3 -m booking_agent.cli --backend live preflight
+```
+
+Every line should be ✓, ending with `READY — it will fire at 06:58`.
+
+---
+
+## Using it
+
+It runs by itself **Tuesday–Friday at 06:58**, always for the upcoming
+Saturday. Tuesday is the release morning. Wednesday–Friday catch a release
+that opened late (holiday weeks shift it) — once you're booked, those runs
+see the reservation and do nothing.
+
+After each run you get a macOS notification, and the result is logged:
+
+```bash
+python3 -m booking_agent.cli history                  # every attempt and outcome
+tail -30 data/launchd.log                             # full output of scheduled runs
+python3 -m booking_agent.cli whoami                   # your upcoming reservations
+python3 -m booking_agent.cli cancel <reservation_id>  # id from history or whoami
+```
+
+Every run ends in exactly one of: `BOOKED`, `ALREADY_BOOKED`, `UNAVAILABLE`,
+`WAITLISTED`, or `ERROR` — it never fails silently.
+
+### Know the course's rules
+
+The server enforces these, and `rules` shows the live values:
+
+- **One booking per day** per account.
+- **Two no-shows and your account is restricted.** The agent books every
+  Saturday whether or not you end up playing — **cancel any week you can't
+  make** so a skipped round doesn't cost you a strike.
+
+---
+
+## Troubleshooting
+
+| symptom | likely cause |
+|---|---|
+| `No module named 'tomllib'` | Python older than 3.11 — see step 1; reinstall the plist with the right `$PY` |
+| `UNAVAILABLE` with "waited for the release window to open" | the date never opened while it was polling (usually a holiday shifting the release). The next morning's run retries |
+| `UNAVAILABLE`, sheet open but nothing matched | nothing in your window with enough seats — `peek` shows what exists |
+| `ERROR` about the card | `card_id` / `card_last4` don't match a saved card — rerun `whoami` |
+| `ERROR` about auth / Keychain | password missing or changed — redo step 5 |
+| nothing happened at all | the Mac was asleep or the job isn't loaded — run `preflight` |
+| every slot filtered out | `course` in the config must be exactly `George Wright Golf Course` |
+
+---
+
+## Where things live
 
 | what | where |
 |---|---|
 | password | macOS Keychain, service `georgewright-cps` |
-| card token | fetched per booking, in memory only, never written |
-| card id + last 4 | `preferences.toml` — lookup keys, not credentials |
+| account + card lookup keys | `config/preferences.toml` (gitignored) |
+| card token | fetched per booking, held in memory only, never written |
+| attempt ledger, logs | `data/` (gitignored) |
 
-An account can have **two saved cards sharing a last-4**, and the account
-default is a *different* card. So `card_id` and `card_last4` must both match or
-`resolve_card_token()` refuses to book rather than silently charging the wrong
-card.
+Nothing sensitive is committed to this repo.
 
-## What the server told us
+---
 
-`cli.py rules` reads this live rather than hardcoding it:
-
-```
-days_in_advance      4        →  Tuesday 07:00 releases Saturday
-release_time         07:00:00
-max_daily_bookings   1        →  one booking per day, server-enforced
-no_show_limit        2        →  two no-shows and the account is restricted
-```
-
-`max_daily_bookings: 1` means the idempotency guard maps to a real constraint.
-`no_show_limit: 2` is the argument for the Friday weather re-check — an
-auto-booked tee time you skip in the rain actually costs you something.
-
-## Two findings that changed the design
-
-**Not-yet-released is a 400, not an empty list.** The API answers a date past
-the window with `400 "Sorry, you are not able to book this tee time
-currently."` The obvious implementation treats that as an error and aborts —
-one second before inventory drops, every single Tuesday. `NotYetReleased` is a
-distinct exception that the poll loop swallows and retries. Tested both ways.
-
-**The course name has to match exactly.** `preferences.toml` originally said
-`"George Wright"`; the API reports `"George Wright Golf Course"`. The filter
-rejected the entire sheet and the run looked like a sold-out Saturday.
-`TestConfigMatchesReality` guards it now — cheap test, expensive failure.
-
-## Layout
+## How it works
 
 ```
 booking_agent/
-  models.py            Slot / Booking / Outcome / GolfPrefs, Status enum
-  config.py            preferences.toml → GolfPrefs
-  store.py             SQLite attempt ledger — the idempotency guard
+  cli.py               commands (run, peek, rules, whoami, preflight, cancel, history, simulate)
+  tasks/golf.py        the run: poll → rank → lock → confirm → report
+  adapters/cps_golf.py the live CPS Golf API
+  adapters/fake_golf.py a synthetic George Wright for tests and `simulate`
+  auth.py              Keychain password → signed-in session
+  store.py             SQLite ledger — the idempotency guard
+  config.py            preferences.toml → settings
   notify.py            outcome → stdout + macOS notification
-  context.py           check_weather() via api.weather.gov (live, keyless)
-  brief.py             Phase B model summary — dormant, opt-in
-  adapters/
-    base.py            Protocol + the exception taxonomy
-    cps_golf.py        live CPS Golf adapter (read path done)
-    fake_golf.py       synthetic George Wright, mirrors real failure modes
-  tasks/golf.py        the deterministic run
-config/preferences.toml
+  context.py           weather forecast (api.weather.gov), advisory only
+  brief.py             optional local-model summary (off by default)
+config/preferences.example.toml
 docs/RECON.md          how the API was mapped
+docs/POSTMORTEM-2026-08-11.md
+scripts/booking-agent.plist   launchd template
 ```
 
-## Deliberate choices
+The `--backend` flag defaults to `fake`; pass `--backend live` for the real
+site, plus `--login` for anything that books.
 
-**Two independent idempotency checks.** Ledger consulted *before* the site,
-because it still works when the session is dead. Prevents: job books, crashes
-before recording, cron retries, you're double-booked into a no-show strike.
+**Booking is hold-then-confirm.** `LockTeeTimes` takes the slot out of
+circulation for ~10 minutes; the remaining calls (price, restriction check,
+reserve) run inside that hold. So the 07:00 race is only `search → lock`, and
+a failed run releases its hold instead of sitting on the slot.
 
-**Partial adapters degrade, they don't crash.** The live adapter can't read
-your existing bookings yet, so the run falls back to ledger-only and *says so*
-in the notification rather than silently dropping a safety check.
+**"Not released yet" is an HTTP 400, not an empty list.** Treated as an error,
+it would abort one second before inventory drops, every week. The poll loop
+recognises it and keeps polling.
 
-**Fall-through on snipe.** Your top choice is routinely gone between `search`
-and `book`. That's `SlotUnavailable`, expected, walk down to `max_attempts`.
+**`LockTeeTimes` reports a lost slot as `{"error": ...}` in a 200.** Checking
+only the status code would "succeed" on a slot someone else took.
 
-**Every run reports a terminal state.** `BOOKED` / `WAITLISTED` /
-`ALREADY_BOOKED` / `UNAVAILABLE` / `ERROR`. Silence is never an outcome.
+**If your first choice is sniped,** it walks down the ranked list, up to
+`max_attempts`.
 
-**Bounded "earliest".** `no_earlier_than = 06:30`, `no_later_than = 11:00`.
-Widen in June; the evening twilight 18-hole slots are correctly excluded now.
+**Two independent double-booking checks:** the local ledger (works even if the
+session is dead) and your live reservations on the server.
 
-**Weather is advisory, never a gate.** Book first, report the forecast,
-re-check Friday.
+**Weather is advisory, never a gate** — it books first and includes the
+forecast in the notification.
 
-## Next
+### Rehearse the race
 
-1. **HAR capture** — log in, book one tee time manually with DevTools open,
-   save the Network tab as HAR. That unblocks `book_tee_time`,
-   `cancel_booking`, and `get_existing_bookings` in `adapters/cps_golf.py`.
-   Credentials go in Keychain, never in this repo:
-   `security add-generic-password -a <email> -s georgewright-cps -w`
-2. **cron at 06:57** — pin to `America/New_York` or DST bites twice a year.
-   Warm the token before 07:00 rather than cold-starting into the race.
-3. **Then the agent layer** — `--brief`, Ollama, tool-calling loop.
+```bash
+python3 -m booking_agent.cli simulate     # fake 07:00 release with competing bookers
+```
+
+### Optional: model summary
+
+`run --brief` asks a local model (e.g. [Ollama](https://ollama.com)) for a
+one-paragraph summary of the outcome. Off by default and never on the booking
+path. Configure with `BOOKING_AGENT_MODEL_URL` (default
+`http://localhost:11434/v1`) and `BOOKING_AGENT_MODEL` (default `qwen3:8b`);
+check with `python3 -m booking_agent.cli check-model`.
+
+---
+
+## Caveats
+
+- **Unofficial.** This talks to the same API the course's booking website uses.
+  It isn't affiliated with the course or the city, and it can break whenever
+  the site changes. Use it with your own account and within the course's
+  booking rules.
+- The site sits behind Cloudflare bot detection. This tool makes ordinary API
+  calls and makes no attempt to get around it; if requests start being
+  challenged, it will stop working rather than escalate.
+- Verified end to end with the non-resident rate and both 2- and 4-player
+  bookings.
