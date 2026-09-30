@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from booking_agent import config, context, notify
@@ -19,6 +19,7 @@ from booking_agent.adapters.fake_golf import FakeGolfAdapter
 from booking_agent.models import Status
 from booking_agent.store import Ledger
 from booking_agent.tasks import golf
+from booking_agent.trace import PollTrace, summarize
 
 _DATA = Path(__file__).resolve().parent.parent / "data"
 LEDGER_PATH = _DATA / "ledger.db"
@@ -31,6 +32,11 @@ FAKE_LEDGER_PATH = _DATA / "ledger-fake.db"
 
 def _ledger_path(backend: str) -> Path:
     return LEDGER_PATH if backend == "live" else FAKE_LEDGER_PATH
+
+
+def _polls_dir(backend: str) -> Path:
+    # Split like the ledger, so a fake rehearsal never shows up as a real run.
+    return _DATA / ("polls" if backend == "live" else "polls-fake")
 
 
 def _adapter(args):
@@ -69,15 +75,25 @@ def cmd_run(args) -> int:
         adapter.preload_booking(target)
 
     ledger = Ledger(_ledger_path(args.backend))
-    outcome = golf.run(
-        adapter,
-        prefs,
-        target,
-        ledger,
-        deadline_s=raw.get("deadline_seconds", 90),
-        poll_interval_s=raw.get("poll_interval_seconds", 0.5),
-        dry_run=args.dry_run,
+    trace = PollTrace(
+        _polls_dir(args.backend) / f"{datetime.now():%Y-%m-%d_%H%M%S}_{target}.jsonl"
     )
+    try:
+        outcome = golf.run(
+            adapter,
+            prefs,
+            target,
+            ledger,
+            deadline_s=raw.get("deadline_seconds", 90),
+            poll_interval_s=raw.get("poll_interval_seconds", 0.5),
+            dry_run=args.dry_run,
+            trace=trace,
+        )
+    finally:
+        trace.close()
+    if not outcome.ok:
+        outcome.notes.append(f"poll log: data/{trace.path.parent.name}/{trace.path.name} "
+                             "— `cli polls` shows the timeline")
 
     body = None
     if args.brief:
@@ -259,6 +275,23 @@ def cmd_simulate(args) -> int:
     return 0 if outcome.ok else 1
 
 
+def cmd_polls(args) -> int:
+    """Timeline of one run's polls: when the date opened, what the sheet held,
+    which filter excluded what, and every lock attempt."""
+    if args.file:
+        path = Path(args.file)
+    else:
+        logs = sorted(_polls_dir(args.backend).glob("*.jsonl"))
+        if args.target:
+            logs = [p for p in logs if p.stem.endswith(args.target)]
+        if not logs:
+            print(f"no poll logs in {_polls_dir(args.backend)}")
+            return 1
+        path = logs[-1]
+    print(summarize(path))
+    return 0
+
+
 def cmd_history(args) -> int:
     ledger = Ledger(_ledger_path(args.backend))
     rows = ledger.recent(args.limit)
@@ -331,6 +364,11 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("cancel", help="cancel a reservation by id")
     c.add_argument("reservation_id")
     c.set_defaults(func=cmd_cancel)
+
+    g = sub.add_parser("polls", help="timeline of a run's polls (latest by default)")
+    g.add_argument("--target", help="YYYY-MM-DD: latest run for this Saturday")
+    g.add_argument("--file", help="a specific data/polls/*.jsonl")
+    g.set_defaults(func=cmd_polls)
 
     h = sub.add_parser("history", help="show past attempts")
     h.add_argument("--limit", type=int, default=20)

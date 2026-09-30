@@ -277,5 +277,86 @@ class TestFailureModes(unittest.TestCase):
         self.assertIn("log in", out.error)
 
 
+class _NothingMatchesAdapter:
+    """An open sheet with only 9-hole twilight slots — what George Wright's
+    Saturday looks like once the prime tee times are gone."""
+
+    search_calls = 0
+
+    def get_existing_bookings(self):
+        return []
+
+    def search_tee_times(self, day):
+        self.search_calls += 1
+        return [slot(16, 45, holes=9), slot(17, 30, holes=9, spots=2)]
+
+
+class TestPollTrace(unittest.TestCase):
+    """The trace exists to answer 'why did Tuesday miss?' after the fact."""
+
+    def _run_traced(self, adapter, clock, **kw):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from booking_agent.trace import PollTrace
+
+        path = Path(tempfile.mkdtemp()) / "run.jsonl"
+        trace = PollTrace(path, now=clock.now)
+        out = golf.run(adapter, PREFS, SATURDAY, ledger(), now=clock.now,
+                       sleep=clock.sleep, trace=trace, **kw)
+        trace.close()
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        return out, events, path
+
+    def test_records_release_then_the_winning_attempt(self):
+        from booking_agent.trace import summarize
+
+        clock = FakeClock(datetime(2026, 8, 11, 6, 59, 58))
+        adapter = FakeGolfAdapter(release_at=datetime(2026, 8, 11, 7, 0, 0),
+                                  steal_probability=0.0, now=clock.now)
+        out, events, path = self._run_traced(adapter, clock,
+                                             deadline_s=30, poll_interval_s=0.5)
+        self.assertIs(out.status, Status.BOOKED)
+
+        polls = [e for e in events if e["kind"] == "poll"]
+        self.assertEqual(polls[0]["result"], "not_released")
+        self.assertIn("msg", polls[0], "first refusal should keep the server's wording")
+        opened = next(e for e in polls if e["result"] == "sheet")
+        self.assertGreater(opened["match"], 0)
+        self.assertIn("sheet", opened, "first open sheet should be dumped in full")
+        self.assertEqual([e["result"] for e in events if e["kind"] == "attempt"], ["won"])
+        self.assertEqual(events[0]["kind"], "start")
+        self.assertEqual(events[-1]["status"], "BOOKED")
+
+        timeline = summarize(path)
+        self.assertIn("not released", timeline)
+        self.assertIn("OPEN", timeline)
+        self.assertIn("attempt", timeline)
+
+    def test_note_says_the_date_never_opened(self):
+        clock = FakeClock(datetime(2026, 8, 11, 6, 58, 0))
+        adapter = FakeGolfAdapter(release_at=datetime(2026, 8, 11, 8, 0, 0),
+                                  now=clock.now)
+        out, _, _ = self._run_traced(adapter, clock, deadline_s=10, poll_interval_s=1.0)
+        self.assertIs(out.status, Status.UNAVAILABLE)
+        self.assertTrue(any("never opened" in n for n in out.notes), out.notes)
+
+    def test_note_says_open_but_nothing_matched(self):
+        clock = FakeClock(datetime(2026, 8, 11, 7, 0, 0))
+        out, events, _ = self._run_traced(_NothingMatchesAdapter(), clock,
+                                          deadline_s=3, poll_interval_s=1.0)
+        self.assertIs(out.status, Status.UNAVAILABLE)
+        self.assertTrue(any("none had 4 open seats" in n for n in out.notes), out.notes)
+        sheet = next(e for e in events if e["kind"] == "poll")
+        self.assertEqual((sheet["slots"], sheet["holes_ok"], sheet["match"]), (2, 0, 0))
+
+    def test_note_says_sold_out(self):
+        clock = FakeClock(datetime(2026, 8, 11, 7, 0, 0))
+        out, _, _ = self._run_traced(FakeGolfAdapter(sold_out=True), clock,
+                                     deadline_s=3, poll_interval_s=1.0)
+        self.assertTrue(any("completely sold out" in n for n in out.notes), out.notes)
+
+
 if __name__ == "__main__":
     unittest.main()

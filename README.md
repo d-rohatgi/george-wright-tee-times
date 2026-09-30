@@ -173,6 +173,7 @@ After each run you get a macOS notification, and the result is logged:
 
 ```bash
 python3 -m booking_agent.cli history                  # every attempt and outcome
+python3 -m booking_agent.cli --backend live polls     # second-by-second timeline of the last run
 tail -30 data/launchd.log                             # full output of scheduled runs
 python3 -m booking_agent.cli whoami                   # your upcoming reservations
 python3 -m booking_agent.cli cancel <reservation_id>  # id from history or whoami
@@ -180,6 +181,25 @@ python3 -m booking_agent.cli cancel <reservation_id>  # id from history or whoam
 
 Every run ends in exactly one of: `BOOKED`, `ALREADY_BOOKED`, `UNAVAILABLE`,
 `WAITLISTED`, or `ERROR` — it never fails silently.
+
+### Why did it miss? — the poll log
+
+Every run writes a trace to `data/polls/` (one JSON line per poll), and
+`polls` turns it into a timeline:
+
+```
+Target Sat Oct 10 2026 · 4 players · 18 holes · 10:00–14:00 · deadline 300s
+  06:58:01.2 → 06:59:59.8  not released  ×131  (370 ms/poll)
+                           server said: "... You may book this tee time starting at [7:00 AM]."
+  07:00:00.6               OPEN — 38 tee times · 30 with enough holes · 14 with enough seats · 12 in window · 5 match
+                           sheet: 07:00/18h/4 07:10/18h/2 ...
+  07:00:00.9               attempt 10:10 — lost (...)  140 ms
+  07:00:01.1               attempt 10:30 — won  120 ms
+```
+
+It shows whether the date opened on time, exactly what the sheet held, which
+of your rules excluded each slot, and how every lock attempt went. Add
+`--target YYYY-MM-DD` for a specific Saturday's latest run.
 
 ### Know the course's rules
 
@@ -197,8 +217,9 @@ The server enforces these, and `rules` shows the live values:
 | symptom | likely cause |
 |---|---|
 | `No module named 'tomllib'` | Python older than 3.11 — see step 1; reinstall the plist with the right `$PY` |
-| `UNAVAILABLE` with "waited for the release window to open" | the date never opened while it was polling (usually a holiday shifting the release). The next morning's run retries |
-| `UNAVAILABLE`, sheet open but nothing matched | nothing in your window with enough seats — `peek` shows what exists |
+| `UNAVAILABLE` — "the date never opened" | the release came late or moved (holiday weeks). The next morning's run retries |
+| `UNAVAILABLE` — "the sheet opened … but none had N open seats" | the sheet was open but nothing matched your rules — `polls` shows what was there and why each slot failed |
+| `UNAVAILABLE` — "completely sold out" | every tee time for that day is taken — common for Saturdays by midweek |
 | `ERROR` about the card | `card_id` / `card_last4` don't match a saved card — rerun `whoami` |
 | `ERROR` about auth / Keychain | password missing or changed — redo step 5 |
 | nothing happened at all | the Mac was asleep or the job isn't loaded — run `preflight` |
@@ -213,7 +234,7 @@ The server enforces these, and `rules` shows the live values:
 | password | macOS Keychain, service `georgewright-cps` |
 | account + card lookup keys | `config/preferences.toml` (gitignored) |
 | card token | fetched per booking, held in memory only, never written |
-| attempt ledger, logs | `data/` (gitignored) |
+| attempt ledger, logs, poll traces | `data/` (gitignored) |
 
 Nothing sensitive is committed to this repo.
 
@@ -223,12 +244,13 @@ Nothing sensitive is committed to this repo.
 
 ```
 booking_agent/
-  cli.py               commands (run, peek, rules, whoami, preflight, cancel, history, simulate)
+  cli.py               commands (run, peek, rules, whoami, preflight, cancel, history, polls, simulate)
   tasks/golf.py        the run: poll → rank → lock → confirm → report
   adapters/cps_golf.py the live CPS Golf API
   adapters/fake_golf.py a synthetic George Wright for tests and `simulate`
   auth.py              Keychain password → signed-in session
   store.py             SQLite ledger — the idempotency guard
+  trace.py             per-poll trace + the `polls` timeline
   config.py            preferences.toml → settings
   notify.py            outcome → stdout + macOS notification
   context.py           weather forecast (api.weather.gov), advisory only
