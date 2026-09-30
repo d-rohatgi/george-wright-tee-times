@@ -1,4 +1,4 @@
-# booking-agent
+# George Wright Tee Times
 
 Automatically books a Saturday tee time at **George Wright Golf Course**
 (Boston) the moment the tee sheet opens.
@@ -13,6 +13,15 @@ the course's server rather than assuming it.
 - **Python 3.11+, standard library only.** No `pip install`.
 - **Your own account.** It books with your City of Boston golf (CPS Golf)
   login and a card you've already saved on that account.
+- **A Mac that's on at 7am**, Tuesday–Friday — a desktop, or a laptop left
+  plugged in with the lid open.
+
+### Setup at a glance
+
+1. Python 3.11+ → 2. clone and run the tests → 3. golf account with a saved
+card → 4. copy the example config → 5. password into Keychain → 6. `whoami` to
+fill in your card → 7. set players / holes / time window → 8. dry run →
+9. install the schedule and keep the Mac awake. About 15 minutes.
 
 ---
 
@@ -36,8 +45,8 @@ Every command below uses `python3` — make sure it points at 3.11+.
 ### 2. Get the code and run the tests
 
 ```bash
-git clone <this repo> booking-agent
-cd booking-agent
+git clone https://github.com/d-rohatgi/george-wright-tee-times.git
+cd george-wright-tee-times
 python3 -m unittest discover -s tests      # offline, ~1s
 ```
 
@@ -185,7 +194,7 @@ Every run ends in exactly one of: `BOOKED`, `ALREADY_BOOKED`, `UNAVAILABLE`,
 ### Why did it miss? — the poll log
 
 Every run writes a trace to `data/polls/` (one JSON line per poll), and
-`polls` turns it into a timeline:
+`polls` turns it into a timeline — for example:
 
 ```
 Target Sat Oct 10 2026 · 4 players · 18 holes · 10:00–14:00 · deadline 300s
@@ -219,11 +228,19 @@ The server enforces these, and `rules` shows the live values:
 | `No module named 'tomllib'` | Python older than 3.11 — see step 1; reinstall the plist with the right `$PY` |
 | `UNAVAILABLE` — "the date never opened" | the release came late or moved (holiday weeks). The next morning's run retries |
 | `UNAVAILABLE` — "the sheet opened … but none had N open seats" | the sheet was open but nothing matched your rules — `polls` shows what was there and why each slot failed |
-| `UNAVAILABLE` — "completely sold out" | every tee time for that day is taken — common for Saturdays by midweek |
+| `UNAVAILABLE` — "completely sold out" | no tee times at all that day — a tournament or closure, or simply booked up (common for Saturdays by midweek) |
 | `ERROR` about the card | `card_id` / `card_last4` don't match a saved card — rerun `whoami` |
 | `ERROR` about auth / Keychain | password missing or changed — redo step 5 |
 | nothing happened at all | the Mac was asleep or the job isn't loaded — run `preflight` |
 | every slot filtered out | `course` in the config must be exactly `George Wright Golf Course` |
+
+### Uninstall
+
+```bash
+launchctl unload ~/Library/LaunchAgents/local.booking-agent.plist
+rm ~/Library/LaunchAgents/local.booking-agent.plist
+security delete-generic-password -s georgewright-cps
+```
 
 ---
 
@@ -312,3 +329,10 @@ check with `python3 -m booking_agent.cli check-model`.
   challenged, it will stop working rather than escalate.
 - Verified end to end with the non-resident rate and both 2- and 4-player
   bookings.
+
+---
+
+## License
+
+[MIT](LICENSE) — use it, change it, share it. No warranty: it books real tee
+times on a real account, so read what it does before you schedule it.
