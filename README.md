@@ -124,10 +124,17 @@ Still in `config/preferences.toml`:
 | `max_attempts` | `6` | how many slots to try if the first gets taken |
 | `deadline_seconds` | `300` | how long to keep polling (must be ≥ 240 for a 06:58 start) |
 
+> **Pick the window with care.** Members (class `MEM`) can book **5 days**
+> ahead — Monday 7:00 for a Saturday, a day before everyone else — so on a
+> busy weekend the morning and midday are often gone before the public window
+> opens on Tuesday. What's left at Tuesday 7:00 tends to start in the early
+> afternoon and goes within a minute. If you keep missing, run `polls` after a
+> miss: it shows exactly what was on the sheet at 7:00.
+
 ### 8. Try it without booking
 
 ```bash
-python3 -m booking_agent.cli rules                   # the server's booking window
+python3 -m booking_agent.cli rules                   # the booking window for your member class
 python3 -m booking_agent.cli --backend live peek     # upcoming Saturday's tee sheet (--date for another day)
 python3 -m booking_agent.cli --backend live --login run --dry-run --date YYYY-MM-DD
 ```
@@ -215,6 +222,8 @@ of your rules excluded each slot, and how every lock attempt went. Add
 The server enforces these, and `rules` shows the live values:
 
 - **One booking per day** per account.
+- **4 days ahead at 7:00** for residents and non-residents; **5 days** for
+  members (`MEM`).
 - **Two no-shows and your account is restricted.** The agent books every
   Saturday whether or not you end up playing — **cancel any week you can't
   make** so a skipped round doesn't cost you a strike.
@@ -229,6 +238,8 @@ The server enforces these, and `rules` shows the live values:
 | `UNAVAILABLE` — "the date never opened" | the release came late or moved (holiday weeks). The next morning's run retries |
 | `UNAVAILABLE` — "the sheet opened … but none had N open seats" | the sheet was open but nothing matched your rules — `polls` shows what was there and why each slot failed |
 | `UNAVAILABLE` — "completely sold out" | no tee times at all that day — a tournament or closure, or simply booked up (common for Saturdays by midweek) |
+| `UNAVAILABLE` — "couldn't get a usable answer from the server" | the booking site was down or overloaded for the whole run. The next morning's run retries |
+| `ERROR` — "unexpected …" | a bug, or a response the agent didn't expect. The run still reported it instead of dying silently; the details are in `data/launchd.err` |
 | `ERROR` about the card | `card_id` / `card_last4` don't match a saved card — rerun `whoami` |
 | `ERROR` about auth / Keychain | password missing or changed — redo step 5 |
 | nothing happened at all | the Mac was asleep or the job isn't loaded — run `preflight` |
@@ -295,6 +306,14 @@ only the status code would "succeed" on a slot someone else took.
 
 **If your first choice is sniped,** it walks down the ranked list, up to
 `max_attempts`.
+
+**Server hiccups are retried, never fatal.** Right at 7:00 the site can take
+6 seconds to answer, or time out. Timeouts, dropped connections and 5xx errors
+are logged and retried until the deadline. If a booking call errors out, the
+agent checks your reservations before trying another slot — a reply that
+never arrived may still have been a booking. A momentary "no tee times"
+answer is re-checked before it's believed. And if something truly unexpected
+happens, the run still ends with a notification and a ledger entry.
 
 **Two independent double-booking checks:** the local ledger (works even if the
 session is dead) and your live reservations on the server.

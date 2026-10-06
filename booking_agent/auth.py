@@ -11,6 +11,7 @@ never lands in shell history:
 
 from __future__ import annotations
 
+import http.client
 import json
 import subprocess
 import time
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from booking_agent.adapters.base import AuthExpired
+from booking_agent.adapters.base import AuthExpired, TransientError
 
 HOST = "https://georgewright.cps.golf"
 TOKEN_ENDPOINT = f"{HOST}/identityapi/connect/token"
@@ -124,6 +125,9 @@ class AuthSession:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
+            if exc.code >= 500:
+                # The identity server having a bad moment is not a bad password.
+                raise TransientError(f"token grant: server error {exc.code}") from exc
             detail = exc.read().decode(errors="replace")[:200]
             # Never echo the body verbatim beyond the error code — it can
             # contain hints about the credential.
@@ -131,8 +135,13 @@ class AuthSession:
                 f"token grant failed ({exc.code}). "
                 f"Check the Keychain entry for {self.account}. {detail[:80]}"
             ) from exc
-        except urllib.error.URLError as exc:
-            raise AuthExpired(f"network: {exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.HTTPException) as exc:
+            # Was AuthExpired: a network blip at 06:58 aborted the run and
+            # blamed the Keychain password. It's retryable, not a login problem.
+            raise TransientError(
+                f"token grant: network: {getattr(exc, 'reason', exc)}"
+            ) from exc
 
         self._access = data["access_token"]
         self._refresh = data.get("refresh_token")

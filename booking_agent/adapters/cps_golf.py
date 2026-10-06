@@ -11,6 +11,7 @@ payloads drop straight in below.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -27,6 +28,7 @@ from booking_agent.adapters.base import (
     NotYetReleased,
     RateLimited,
     SlotUnavailable,
+    TransientError,
 )
 from booking_agent.models import Booking, Slot
 
@@ -52,6 +54,10 @@ _UA = (
 
 # The server's phrasing when the date is beyond daysInAdvance. Matched loosely
 # because vendors reword these; the 400 + "not able to book" shape is stable.
+# Failures that arrive as something other than urllib's URLError — a read
+# timeout or a reset mid-response comes straight out of resp.read().
+_NETWORK_ERRORS = (TimeoutError, ConnectionError, http.client.HTTPException)
+
 _NOT_RELEASED_MARKERS = ("not able to book", "membership only")
 
 
@@ -101,6 +107,26 @@ class CPSGolfAdapter:
 
     def search_tee_times(self, day: date) -> list[Slot]:
         self.search_calls += 1
+        content = self._fetch_sheet(day)
+        if not content:
+            # Under load the server sometimes answers NO_TEETIMES for a sheet
+            # that has tee times — 6 of 212 polls on 2026-10-06, and it made
+            # `peek` show Oct 4 as empty. Confirm once, with a fresh
+            # transaction, before believing it.
+            content = self._fetch_sheet(day)
+
+        slots: list[Slot] = []
+        for raw in content or []:
+            slot = _to_slot(raw)
+            if slot is None:
+                continue
+            self._raw_slots[slot.id] = raw
+            slots.append(slot)
+        return slots
+
+    def _fetch_sheet(self, day: date) -> list[dict] | None:
+        """One sheet read: register a transaction id, then query with it.
+        None when the server answers with a message instead of a list."""
         tx = str(uuid.uuid4())
         self._post("/RegisterTransactionId", {"transactionId": tx})
 
@@ -126,19 +152,9 @@ class CPSGolfAdapter:
         payload = self._get(f"/TeeTimes?{qs}")
         content = payload.get("content")
 
-        # An empty sheet is a *successful* response with a message object, not
-        # an error and not a list. Both mean "nothing to book right now".
-        if not isinstance(content, list):
-            return []
-
-        slots: list[Slot] = []
-        for raw in content:
-            slot = _to_slot(raw)
-            if slot is None:
-                continue
-            self._raw_slots[slot.id] = raw
-            slots.append(slot)
-        return slots
+        # An empty sheet is a *successful* response with a message object
+        # (NO_TEETIMES), not an error and not a list.
+        return content if isinstance(content, list) else None
 
     def _participant_numbers(self, slot_id: str, players: int) -> list[int]:
         """The exact seat numbers to book.
@@ -159,15 +175,17 @@ class CPSGolfAdapter:
             )
         return available[:players]
 
-    def booking_rules(self) -> dict:
+    def booking_rules(self, class_code: str = "R") -> dict:
         """Release window straight from the server: daysInAdvance + time.
 
         Read this instead of hardcoding "Tuesday 7am for Saturday" — if the
         course moves the window, the agent follows instead of silently missing.
+        The window depends on member class: R/RES/NRES get 4 days, MEM gets 5
+        (checked 2026-10-06), so ask for the account's own class.
         """
         qs = urllib.parse.urlencode(
             {
-                "classcode": "R",
+                "classcode": class_code,
                 "courseIds": self.course_id,
                 "searchDate": _cps_date(date.today()),
             }
@@ -196,10 +214,10 @@ class CPSGolfAdapter:
             "no_show_limit": by_course.get("noShowLimit"),
         }
 
-    def target_date(self, today: date | None = None) -> date:
+    def target_date(self, today: date | None = None, class_code: str = "R") -> date:
         """The furthest-out date the server will currently let us book."""
         today = today or date.today()
-        days = self.booking_rules().get("days_in_advance") or 4
+        days = self.booking_rules(class_code).get("days_in_advance") or 4
         return today + timedelta(days=days)
 
     # -- write path --------------------------------------------------------
@@ -608,8 +626,14 @@ class CPSGolfAdapter:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 self._token = json.loads(resp.read())["access_token"]
-        except (urllib.error.HTTPError, KeyError, ValueError) as exc:
+        except urllib.error.HTTPError as exc:
+            if exc.code >= 500:
+                raise TransientError(f"token endpoint {exc.code}") from exc
             raise AuthExpired(f"could not mint short-lived token: {exc}") from exc
+        except (KeyError, ValueError) as exc:
+            raise AuthExpired(f"could not mint short-lived token: {exc}") from exc
+        except (urllib.error.URLError, *_NETWORK_ERRORS) as exc:
+            raise TransientError(f"token: network: {getattr(exc, 'reason', exc)}") from exc
         self._token_fetched_at = time.monotonic()
         return self._token
 
@@ -642,9 +666,13 @@ class CPSGolfAdapter:
                 raise AuthExpired(f"{exc.code}: {body[:160]}") from exc
             if exc.code == 429:
                 raise RateLimited(body[:160]) from exc
+            if exc.code >= 500:
+                raise TransientError(f"{exc.code}: {body[:160]}") from exc
             raise AdapterError(f"{exc.code}: {body[:200]}") from exc
         except urllib.error.URLError as exc:
-            raise AdapterError(f"network: {exc.reason}") from exc
+            raise TransientError(f"network: {exc.reason}") from exc
+        except _NETWORK_ERRORS as exc:
+            raise TransientError(f"network: {type(exc).__name__}: {exc}") from exc
 
         try:
             return json.loads(raw) if raw else {}

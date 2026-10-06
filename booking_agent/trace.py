@@ -74,7 +74,8 @@ def _poll_label(ev: dict) -> str:
 def summarize(path: Path) -> str:
     """A trace as a timeline. Consecutive identical polls collapse into one
     line; the sheet is printed whenever it changed."""
-    events = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    with open(path, encoding="utf-8") as fh:
+        events = [json.loads(line) for line in fh if line.strip()]
     lines = [f"Poll log  {path.name}"]
 
     group: list[dict] = []

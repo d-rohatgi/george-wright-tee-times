@@ -138,11 +138,18 @@ def cmd_peek(args) -> int:
 
 
 def cmd_rules(args) -> int:
-    rules = CPSGolfAdapter().booking_rules()
-    print("George Wright booking rules (from the server):")
+    # The window depends on member class (MEM books a day earlier than
+    # R/RES/NRES), so show the configured account's own rule when there is one.
+    try:
+        cls = config.identity().member_class
+    except (OSError, KeyError):
+        cls = "R"
+    adapter = CPSGolfAdapter()
+    rules = adapter.booking_rules(cls)
+    print(f"George Wright booking rules for class {cls} (from the server):")
     for k, v in rules.items():
         print(f"  {k:<20} {v}")
-    print(f"\n  next bookable date: {CPSGolfAdapter().target_date()}")
+    print(f"\n  next bookable date: {adapter.target_date(class_code=cls)}")
     return 0
 
 

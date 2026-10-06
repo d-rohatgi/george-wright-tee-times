@@ -7,7 +7,9 @@ The model gets involved afterwards, in brief.py, where being slow is free.
 
 from __future__ import annotations
 
+import sys
 import time as _time
+import traceback
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -18,6 +20,7 @@ from booking_agent.adapters.base import (
     NotYetReleased,
     RateLimited,
     SlotUnavailable,
+    TransientError,
 )
 from booking_agent.models import GolfPrefs, Outcome, Slot, Status
 from booking_agent.store import Ledger
@@ -87,13 +90,34 @@ def run(
         deadline_s=deadline_s, poll_interval_s=poll_interval_s, dry_run=dry_run,
     )
     stats = {"polls": 0}
-    out = _run(adapter, prefs, target_date, ledger, deadline_s=deadline_s,
-               poll_interval_s=poll_interval_s, now=now, sleep=sleep,
-               dry_run=dry_run, trace=trace, stats=stats)
+    try:
+        out = _run(adapter, prefs, target_date, ledger, deadline_s=deadline_s,
+                   poll_interval_s=poll_interval_s, now=now, sleep=sleep,
+                   dry_run=dry_run, trace=trace, stats=stats)
+    except Exception as exc:  # noqa: BLE001
+        # Last line of defence: a scheduled run must always end in a reported
+        # outcome. On 2026-09-18 an uncaught read timeout ended one with no
+        # notification and no ledger row — a silent miss.
+        traceback.print_exc(file=sys.stderr)
+        out = Outcome(status=Status.ERROR, target_date=target_date,
+                      error=f"unexpected {type(exc).__name__}: {exc}")
+        try:
+            ledger.record(SERVICE, target_date, out)
+        except Exception:  # noqa: BLE001
+            pass
     trace.event("end", status=out.status.value, polls=stats["polls"],
                 considered=out.considered, attempts=len(out.attempted),
                 error=out.error)
     return out
+
+
+def _account_booking(adapter, target_date: date, prefs: GolfPrefs):
+    """The account's existing booking for target_date at this course, if any."""
+    for booking in adapter.get_existing_bookings():
+        if (booking.slot.tee_time.date() == target_date
+                and booking.slot.course == prefs.course):
+            return booking
+    return None
 
 
 def _run(adapter, prefs, target_date, ledger, *, deadline_s, poll_interval_s,
@@ -107,33 +131,43 @@ def _run(adapter, prefs, target_date, ledger, *, deadline_s, poll_interval_s,
         out.notes.append(f"ledger already holds booking {prior} for this date")
         return out
 
-    try:
-        for booking in adapter.get_existing_bookings():
-            if (
-                booking.slot.tee_time.date() == target_date
-                and booking.slot.course == prefs.course
-            ):
-                out.status = Status.ALREADY_BOOKED
-                out.booking = booking
-                out.notes.append("account already holds a booking for this date")
-                return out
-    except AuthExpired as exc:
-        out.error = f"{exc} (check the Keychain password: `python -m booking_agent.cli whoami`)"
-        return out
-    except NotImplementedError:
-        # Live adapter can't read the account yet. Degrade to ledger-only
-        # rather than refusing to run — but say so, because a booking made
-        # outside this agent is now invisible to it.
-        out.notes.append(
-            "account check unavailable (write path not implemented) — "
-            "relying on the local ledger alone for idempotency"
-        )
+    for tries_left in (2, 1, 0):
+        try:
+            existing = _account_booking(adapter, target_date, prefs)
+        except TransientError as exc:
+            # A network blip at 06:58 must not abort the run — there are two
+            # minutes to spare. Retry, then fall back to the ledger.
+            if tries_left:
+                sleep(1.0)
+                continue
+            out.notes.append(
+                f"account check failed ({exc}) — relying on the local ledger alone"
+            )
+            break
+        except AuthExpired as exc:
+            out.error = f"{exc} (check the Keychain password: `python -m booking_agent.cli whoami`)"
+            return out
+        except NotImplementedError:
+            # Live adapter can't read the account yet. Degrade to ledger-only
+            # rather than refusing to run — but say so, because a booking made
+            # outside this agent is now invisible to it.
+            out.notes.append(
+                "account check unavailable (write path not implemented) — "
+                "relying on the local ledger alone for idempotency"
+            )
+            break
+        if existing:
+            out.status = Status.ALREADY_BOOKED
+            out.booking = existing
+            out.notes.append("account already holds a booking for this date")
+            return out
+        break
 
     # --- poll for release, then claim -------------------------------------
     started = now()
     backoff = poll_interval_s
     waited_on_release = False
-    not_released = sheets = peak = 0
+    not_released = sheets = peak = transient = 0
     last_sheet = None
 
     while (now() - started).total_seconds() < deadline_s:
@@ -160,6 +194,13 @@ def _run(adapter, prefs, target_date, ledger, *, deadline_s, poll_interval_s,
             trace.event("poll", result="rate_limited", ms=_ms(t0))
             backoff = min(backoff * 2, 5.0)
             sleep(backoff)
+            continue
+        except TransientError as exc:
+            # Timeout, reset or 5xx — most likely right at 07:00, when the
+            # server is swamped. Never fatal: poll again.
+            transient += 1
+            trace.event("poll", result="transient", ms=_ms(t0), error=str(exc)[:200])
+            sleep(poll_interval_s)
             continue
         except AdapterError as exc:
             trace.event("poll", result="error", ms=_ms(t0), error=str(exc)[:200])
@@ -205,6 +246,28 @@ def _run(adapter, prefs, target_date, ledger, *, deadline_s, poll_interval_s,
                 out.error = str(exc)
                 ledger.record(SERVICE, target_date, out)
                 return out
+            except AdapterError as exc:
+                # A timeout or server error mid-booking is ambiguous: the
+                # reservation may exist even though its reply never arrived.
+                # Ask before trying another slot.
+                trace.event("attempt", slot=f"{slot.tee_time:%H:%M}", result="error",
+                            ms=_ms(t1), error=str(exc)[:160])
+                try:
+                    landed = _account_booking(adapter, target_date, prefs)
+                except Exception:  # noqa: BLE001 — can't confirm either way
+                    landed = None
+                if landed is None:
+                    out.attempted.append(f"{slot.tee_time:%-I:%M %p} — error ({exc})")
+                    continue
+                trace.event("attempt", slot=f"{landed.slot.tee_time:%H:%M}",
+                            result="won (confirmed after error)", ms=_ms(t1))
+                out.status = Status.BOOKED
+                out.booking = landed
+                out.attempted.append(
+                    f"{landed.slot.tee_time:%-I:%M %p} — won (confirmed after: {exc})"
+                )
+                ledger.record(SERVICE, target_date, out)
+                return out
 
             trace.event("attempt", slot=f"{slot.tee_time:%H:%M}", result="won",
                         ms=_ms(t1))
@@ -228,10 +291,16 @@ def _run(adapter, prefs, target_date, ledger, *, deadline_s, poll_interval_s,
     if out.considered == 0:
         # Say WHICH kind of nothing — they have different fixes.
         window = f"{prefs.no_earlier_than:%-I:%M %p}–{prefs.no_later_than:%-I:%M %p}"
-        if sheets == 0:
+        failed = f", {transient} failed requests" if transient else ""
+        if sheets == 0 and not_released == 0 and transient:
             out.notes.append(
-                f"the date never opened in {deadline_s:.0f}s ({not_released} polls, "
-                "all 'not released yet') — the release was late or moved"
+                f"couldn't get a usable answer from the server in {deadline_s:.0f}s "
+                f"— all {transient} requests failed (timeouts or server errors)"
+            )
+        elif sheets == 0:
+            out.notes.append(
+                f"the date never opened in {deadline_s:.0f}s ({not_released} "
+                f"'not released yet' answers{failed}) — the release was late or moved"
             )
         elif peak == 0:
             out.notes.append("the date was open but completely sold out — no tee times at all")

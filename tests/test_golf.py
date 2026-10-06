@@ -358,5 +358,192 @@ class TestPollTrace(unittest.TestCase):
         self.assertTrue(any("completely sold out" in n for n in out.notes), out.notes)
 
 
+class _ScriptedAdapter:
+    """Replays a script of results, for failure paths the fake course can't
+    produce. Each step is an exception (raised) or a value (returned); the
+    last step repeats once the script runs out."""
+
+    def __init__(self, searches, books=(), existing=((),)):
+        self._searches, self._books, self._existing = list(searches), list(books), list(existing)
+        self.book_calls = 0
+        self.search_calls = 0
+
+    @staticmethod
+    def _next(script):
+        step = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def get_existing_bookings(self):
+        return list(self._next(self._existing))
+
+    def search_tee_times(self, day):
+        self.search_calls += 1
+        return list(self._next(self._searches))
+
+    def book_tee_time(self, slot_id, players, holes):
+        self.book_calls += 1
+        return self._next(self._books)
+
+
+def _booking(s: Slot, rid: str = "R1"):
+    from booking_agent.models import Booking
+
+    return Booking(id=rid, slot=s, players=4, confirmed_at=datetime(2026, 8, 11, 7, 0, 5))
+
+
+class TestServerHiccups(unittest.TestCase):
+    """At 07:00 the server answers in up to 6s and sometimes not at all. None of
+    that may end a run early, and every run must still report an outcome."""
+
+    def setUp(self):
+        from booking_agent.adapters.base import TransientError
+
+        self.Transient = TransientError
+        self.clock = FakeClock(datetime(2026, 8, 11, 7, 0, 0))
+
+    def _run(self, adapter, led=None):
+        return golf.run(adapter, PREFS, SATURDAY, led or ledger(), deadline_s=30,
+                        poll_interval_s=0.5, now=self.clock.now, sleep=self.clock.sleep)
+
+    def test_search_timeouts_are_retried_not_fatal(self):
+        adapter = _ScriptedAdapter(
+            searches=[self.Transient("read timed out"), self.Transient("503"), [slot(10)]],
+            books=[_booking(slot(10))],
+        )
+        out = self._run(adapter)
+        self.assertIs(out.status, Status.BOOKED)
+        self.assertEqual(adapter.search_calls, 3)
+
+    def test_booking_timeout_that_actually_landed_is_reported_booked(self):
+        # The reply to the reserve call never arrived, but the reservation
+        # exists. Must report it — not try a second slot and double-book.
+        landed = _booking(slot(10), "R-landed")
+        adapter = _ScriptedAdapter(
+            searches=[[slot(10), slot(10, 30)]],
+            books=[self.Transient("read timed out")],
+            existing=[[], [landed]],
+        )
+        out = self._run(adapter)
+        self.assertIs(out.status, Status.BOOKED)
+        self.assertEqual(out.booking.id, "R-landed")
+        self.assertEqual(adapter.book_calls, 1, "must not attempt a second slot")
+
+    def test_booking_error_that_did_not_land_moves_to_the_next_slot(self):
+        adapter = _ScriptedAdapter(
+            searches=[[slot(10), slot(10, 30)]],
+            books=[self.Transient("502"), _booking(slot(10, 30), "R2")],
+        )
+        out = self._run(adapter)
+        self.assertIs(out.status, Status.BOOKED)
+        self.assertEqual(out.booking.id, "R2")
+        self.assertTrue(any("error" in a for a in out.attempted), out.attempted)
+
+    def test_account_check_blip_falls_back_to_the_ledger(self):
+        adapter = _ScriptedAdapter(
+            searches=[[slot(10)]], books=[_booking(slot(10))],
+            existing=[self.Transient("timed out")],
+        )
+        out = self._run(adapter)
+        self.assertIs(out.status, Status.BOOKED)
+        self.assertTrue(any("account check failed" in n for n in out.notes), out.notes)
+
+    def test_unexpected_crash_still_reports_and_records_an_outcome(self):
+        # 2026-09-18: an uncaught error ended the run with no notification and
+        # no ledger row. Whatever goes wrong, run() must return an Outcome.
+        import contextlib
+        import io
+
+        led = ledger()
+        with contextlib.redirect_stderr(io.StringIO()):  # the traceback is expected
+            out = self._run(_ScriptedAdapter(searches=[RuntimeError("boom")]), led)
+        self.assertIs(out.status, Status.ERROR)
+        self.assertIn("RuntimeError", out.error)
+        self.assertEqual(led.recent(1)[0]["status"], "ERROR")
+
+    def test_note_when_the_server_never_answered(self):
+        out = self._run(_ScriptedAdapter(searches=[self.Transient("timed out")]))
+        self.assertIs(out.status, Status.UNAVAILABLE)
+        self.assertTrue(any("requests failed" in n for n in out.notes), out.notes)
+
+
+class TestCpsErrorMapping(unittest.TestCase):
+    """How raw network failures surface from the live adapter. No network:
+    urlopen is patched."""
+
+    def _adapter(self):
+        import time as _t
+
+        from booking_agent.adapters.cps_golf import CPSGolfAdapter
+
+        a = CPSGolfAdapter()
+        a._token, a._token_fetched_at = "cached", _t.monotonic()  # skip the token call
+        return a
+
+    @staticmethod
+    def _http_error(code: int, body: bytes):
+        import io
+        import urllib.error
+
+        return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(body))
+
+    def _raising(self, exc):
+        from unittest import mock
+
+        return mock.patch("urllib.request.urlopen", side_effect=exc)
+
+    def test_read_timeout_is_transient_not_a_crash(self):
+        from booking_agent.adapters.base import TransientError
+
+        with self._raising(TimeoutError("The read operation timed out")):
+            with self.assertRaises(TransientError):
+                self._adapter()._get("/TeeTimes")
+
+    def test_server_5xx_is_transient(self):
+        from booking_agent.adapters.base import TransientError
+
+        with self._raising(self._http_error(503, b"Service Unavailable")):
+            with self.assertRaises(TransientError):
+                self._adapter()._get("/TeeTimes")
+
+    def test_not_released_400_is_still_recognised(self):
+        from booking_agent.adapters.base import NotYetReleased
+
+        body = b'"Sorry, you are not able to book this tee time currently."'
+        with self._raising(self._http_error(400, body)):
+            with self.assertRaises(NotYetReleased):
+                self._adapter()._get("/TeeTimes")
+
+    def test_login_network_blip_is_transient_not_a_bad_password(self):
+        import urllib.error
+
+        from booking_agent.adapters.base import TransientError
+        from booking_agent.auth import AuthSession
+
+        with self._raising(urllib.error.URLError("nodename nor servname provided")):
+            with self.assertRaises(TransientError):
+                AuthSession("you@example.com")._grant({})
+
+    def test_empty_sheet_is_confirmed_once_before_believed(self):
+        # The server sometimes answers NO_TEETIMES for a sheet that has tee
+        # times (6 of 212 polls on 2026-10-06). One re-check catches it.
+        a = self._adapter()
+        answers = [{"content": {"messageKey": "NO_TEETIMES"}},
+                   {"content": [{"teeSheetId": 1, "startTime": "2026-08-15T10:00:00",
+                                 "holes": 18, "availableParticipantNo": [1, 2, 3, 4]}]}]
+        a._post = lambda path, body: {}
+        a._get = lambda path: answers.pop(0)
+        slots = a.search_tee_times(SATURDAY)
+        self.assertEqual([s.tee_time.hour for s in slots], [10])
+
+    def test_booking_rules_ask_for_the_given_member_class(self):
+        a = self._adapter()
+        asked = []
+        a._get = lambda path: asked.append(path) or {}
+        a.booking_rules("MEM")
+        self.assertIn("classcode=MEM", asked[0])
+
+
 if __name__ == "__main__":
     unittest.main()

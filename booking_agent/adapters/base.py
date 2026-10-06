@@ -43,6 +43,13 @@ class RateLimited(AdapterError):
     """Back off. Retryable with delay."""
 
 
+class TransientError(AdapterError):
+    """A network or server hiccup: read timeout, connection reset, 5xx.
+    Retryable. At 07:00 the server is slowest exactly when it matters (6s
+    responses on 2026-10-06), so one bad response must never end a run — on
+    2026-09-18 an uncaught read timeout killed the run with no notification."""
+
+
 @runtime_checkable
 class GolfAdapter(Protocol):
     def search_tee_times(self, day: date) -> list[Slot]:
