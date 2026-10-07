@@ -49,8 +49,18 @@ def slot(hour: int, minute: int = 0, *, holes: int = 18, spots: int = 4) -> Slot
     )
 
 
+_LEDGERS: list[Ledger] = []
+
+
 def ledger() -> Ledger:
-    return Ledger(":memory:")
+    led = Ledger(":memory:")
+    _LEDGERS.append(led)
+    return led
+
+
+def tearDownModule():
+    for led in _LEDGERS:
+        led.close()
 
 
 class TestTargetDate(unittest.TestCase):
@@ -543,6 +553,85 @@ class TestCpsErrorMapping(unittest.TestCase):
         a._get = lambda path: asked.append(path) or {}
         a.booking_rules("MEM")
         self.assertIn("classcode=MEM", asked[0])
+
+
+DEVINE = "William J. Devine"
+
+
+class TestMultiCourse(unittest.TestCase):
+    """George Wright and Devine share one CPS tenant: one search covers both,
+    and each booking must be made at its own course."""
+
+    def test_prefs_accept_any_listed_course(self):
+        devine_slot = replace(slot(10), course=DEVINE)
+        self.assertFalse(PREFS.matches(devine_slot))
+        both = replace(PREFS, also_courses=(DEVINE,))
+        self.assertTrue(both.matches(devine_slot))
+        self.assertTrue(both.matches(slot(10)))
+
+    def test_one_search_request_covers_every_course(self):
+        from booking_agent.adapters.cps_golf import CPSGolfAdapter
+
+        a = CPSGolfAdapter(also_course_ids=(1,))
+        asked = []
+        a._post = lambda path, body: {}
+        a._get = lambda path: asked.append(path) or {"content": []}
+        a.search_tee_times(SATURDAY)
+        self.assertIn("courseIds=2%2C1", asked[0])
+
+    def test_a_devine_slot_is_booked_at_devine(self):
+        from booking_agent.adapters.cps_golf import CPSGolfAdapter, Identity
+
+        ident = Identity(email="you@example.com", acct="0", card_id=7,
+                         card_last4="1234", golfer_id=99)
+        a = CPSGolfAdapter(also_course_ids=(1,), auth=object(), identity=ident)
+        a._raw_slots["555"] = {"teeSheetId": 555, "courseId": 1, "siteId": 1,
+                               "startTime": "2026-08-15T10:00:00", "holes": 18,
+                               "availableParticipantNo": [1, 2, 3, 4]}
+        posts = []
+        replies = {"/LockTeeTimes": {"sessionId": "s", "error": ""},
+                   "/TeeTimePricesCalculation": {"transactionId": "tx"},
+                   "/ReserveTeeTimes": {"reservationId": 42, "bookingIds": [1]}}
+        a._post = lambda path, body: posts.append((path, body)) or replies.get(path, {})
+        a._get = lambda path: [{"id": 7, "ccMaskedNumber": "XXXX1234", "ccToken": "t" * 32}]
+
+        booking = a.book_tee_time("555", 3, 18)
+
+        self.assertEqual(booking.id, "42")
+        restrict = next(body for path, body in posts if path == "/CheckRestrictReservation")
+        self.assertEqual((restrict["courseId"], restrict["siteId"]), (1, 1))
+
+    def test_a_booking_at_either_course_counts_as_already_booked(self):
+        held = _booking(replace(slot(15), course=DEVINE))
+        out = golf.run(
+            _ScriptedAdapter(searches=[[slot(10)]], existing=[[held]]),
+            replace(PREFS, also_courses=(DEVINE,)), SATURDAY, ledger(),
+            now=FakeClock(datetime(2026, 8, 11, 7, 0)).now,
+        )
+        self.assertIs(out.status, Status.ALREADY_BOOKED)
+
+    def test_cli_overrides_make_one_off_prefs_without_touching_config(self):
+        import argparse
+        from unittest import mock
+
+        from booking_agent import cli
+
+        args = argparse.Namespace(players=3, holes=18, window="06:00-16:00",
+                                  courses="george-wright,devine")
+        with mock.patch.object(cli.config, "golf_prefs", return_value=PREFS):
+            prefs = cli._prefs(args)
+        self.assertEqual(prefs.players, 3)
+        self.assertEqual((prefs.no_earlier_than, prefs.no_later_than), (time(6), time(16)))
+        self.assertEqual(prefs.courses, ("George Wright Golf Course", DEVINE))
+        self.assertEqual(PREFS.players, 4, "config prefs must be untouched")
+
+    def test_cli_rejects_an_unknown_course(self):
+        import argparse
+
+        from booking_agent import cli
+
+        with self.assertRaises(SystemExit):
+            cli._course_names(argparse.Namespace(courses="franklin-park"))
 
 
 if __name__ == "__main__":

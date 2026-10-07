@@ -112,7 +112,8 @@ def summarize(path: Path) -> str:
         flush()
         if kind == "start":
             lines.append(
-                f"Target {ev.get('target')} · {ev.get('players')} players · "
+                f"Target {ev.get('target')} · {' + '.join(ev.get('courses') or []) or 'course'} · "
+                f"{ev.get('players')} players · "
                 f"{ev.get('holes')} holes · {ev.get('window')} · "
                 f"deadline {ev.get('deadline_s')}s{' · DRY RUN' if ev.get('dry_run') else ''}"
             )

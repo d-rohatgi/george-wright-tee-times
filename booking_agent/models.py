@@ -89,10 +89,17 @@ class GolfPrefs:
     no_earlier_than: time
     no_later_than: time
     max_attempts: int = 3
+    # More courses to accept, e.g. Devine alongside George Wright. Ranking stays
+    # "earliest first" across all of them.
+    also_courses: tuple[str, ...] = ()
+
+    @property
+    def courses(self) -> tuple[str, ...]:
+        return (self.course, *self.also_courses)
 
     def matches(self, slot: Slot) -> bool:
         return (
-            slot.course == self.course
+            slot.course in self.courses
             and slot.holes >= self.holes
             and slot.spots >= self.players
             and self.no_earlier_than <= slot.tee_time.time() <= self.no_later_than

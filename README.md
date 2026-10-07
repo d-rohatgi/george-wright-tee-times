@@ -1,7 +1,8 @@
 # George Wright Tee Times
 
 Automatically books a Saturday tee time at **George Wright Golf Course**
-(Boston) the moment the tee sheet opens.
+(Boston) the moment the tee sheet opens — and, for one-off runs, can watch
+**William J. Devine** (Franklin Park) too.
 
 George Wright releases each date **4 days ahead at 07:00** — so Tuesday 07:00
 opens the following Saturday. This agent is scheduled on your Mac for 06:58,
@@ -198,6 +199,35 @@ python3 -m booking_agent.cli cancel <reservation_id>  # id from history or whoam
 Every run ends in exactly one of: `BOOKED`, `ALREADY_BOOKED`, `UNAVAILABLE`,
 `WAITLISTED`, or `ERROR` — it never fails silently.
 
+### One-off runs — another day, party size or course
+
+Any run can override the config for just that run:
+
+```bash
+python3 -m booking_agent.cli --backend live --login run --date 2026-10-11 \
+    --players 3 --window 06:00-16:00 --courses george-wright,devine
+```
+
+| flag | meaning |
+|---|---|
+| `--date YYYY-MM-DD` | the day to book (default: the upcoming Saturday) |
+| `--players N` / `--holes 9\|18` | party size and holes for this run |
+| `--window HH:MM-HH:MM` | accept tee times in this range; earliest wins |
+| `--courses LIST` | `george-wright`, `devine`, or both. Both courses are on the same booking site with the same 4-day / 7:00 release, so they're searched in one request and the earliest qualifying time at either wins |
+| `--deadline SECONDS` | how long to keep polling |
+
+`peek` takes the same flags to preview a sheet. To fire a one-off at release
+time — 06:58, four days before the date — schedule it once:
+
+```bash
+python3 scripts/schedule_once.py 2026-10-07 06:58 -- \
+    --backend live --login run --date 2026-10-11 --players 3 \
+    --window 06:00-16:00 --courses george-wright,devine
+```
+
+It runs at that minute, writes `data/once-<date>-<time>.log`, then removes
+itself. Add `--cancel` (same date and time) to remove it before it fires.
+
 ### Why did it miss? — the poll log
 
 Every run writes a trace to `data/polls/` (one JSON line per poll), and
@@ -287,6 +317,7 @@ config/preferences.example.toml
 docs/RECON.md          how the API was mapped
 docs/POSTMORTEM-2026-08-11.md
 scripts/booking-agent.plist   launchd template
+scripts/schedule_once.py      schedule a single run at a set minute
 ```
 
 The `--backend` flag defaults to `fake`; pass `--backend live` for the real

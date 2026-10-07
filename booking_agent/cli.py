@@ -8,13 +8,14 @@ Default backend is `fake` and the model is off. Both are opt-in:
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 
 from booking_agent import config, context, notify
-from booking_agent.adapters.cps_golf import CPSGolfAdapter
+from booking_agent.adapters.cps_golf import COURSES, CPSGolfAdapter
 from booking_agent.adapters.fake_golf import FakeGolfAdapter
 from booking_agent.models import Status
 from booking_agent.store import Ledger
@@ -39,14 +40,54 @@ def _polls_dir(backend: str) -> Path:
     return _DATA / ("polls" if backend == "live" else "polls-fake")
 
 
+def _course_names(args) -> list[str]:
+    """--courses, validated; George Wright alone when not given."""
+    names = [n.strip() for n in (getattr(args, "courses", None) or "george-wright").split(",")
+             if n.strip()]
+    unknown = [n for n in names if n not in COURSES]
+    if unknown or not names:
+        raise SystemExit(f"--courses: unknown {', '.join(unknown) or '(empty)'} — "
+                         f"choose from {', '.join(COURSES)}")
+    return names
+
+
+def _prefs(args):
+    """Config preferences with this run's one-off overrides applied. Lets an ad
+    hoc run (another day, party size, window or course) leave the config alone."""
+    prefs = config.golf_prefs()
+    changes: dict = {}
+    if getattr(args, "courses", None):
+        names = [COURSES[n][2] for n in _course_names(args)]
+        changes.update(course=names[0], also_courses=tuple(names[1:]))
+    if getattr(args, "players", None):
+        if not 1 <= args.players <= 4:
+            raise SystemExit("--players must be 1-4")
+        changes["players"] = args.players
+    if getattr(args, "holes", None):
+        changes["holes"] = args.holes
+    if getattr(args, "window", None):
+        start, sep, end = args.window.partition("-")
+        try:
+            changes.update(no_earlier_than=time.fromisoformat(start.strip()),
+                           no_later_than=time.fromisoformat(end.strip()))
+        except ValueError:
+            sep = ""
+        if not sep:
+            raise SystemExit("--window must look like 06:00-16:00")
+    return replace(prefs, **changes)
+
+
 def _adapter(args):
     if args.backend == "live":
+        ids = [COURSES[n][:2] for n in _course_names(args)]
+        courses = dict(course_id=ids[0][0], site_id=ids[0][1],
+                       also_course_ids=tuple(cid for cid, _ in ids[1:]))
         if getattr(args, "login", False):
             from booking_agent.auth import AuthSession
 
             ident = config.identity()
-            return CPSGolfAdapter(auth=AuthSession(ident.email), identity=ident)
-        return CPSGolfAdapter()
+            return CPSGolfAdapter(auth=AuthSession(ident.email), identity=ident, **courses)
+        return CPSGolfAdapter(**courses)
     return FakeGolfAdapter(
         sold_out=getattr(args, "sold_out", False),
         auth_expired=getattr(args, "auth_expired", False),
@@ -66,7 +107,7 @@ def _target(args, adapter) -> date:
 
 
 def cmd_run(args) -> int:
-    prefs = config.golf_prefs()
+    prefs = _prefs(args)
     raw = config.load()["george_wright"]
     adapter = _adapter(args)
     target = _target(args, adapter)
@@ -84,7 +125,7 @@ def cmd_run(args) -> int:
             prefs,
             target,
             ledger,
-            deadline_s=raw.get("deadline_seconds", 90),
+            deadline_s=args.deadline or raw.get("deadline_seconds", 90),
             poll_interval_s=raw.get("poll_interval_seconds", 0.5),
             dry_run=args.dry_run,
             trace=trace,
@@ -116,9 +157,9 @@ def cmd_run(args) -> int:
 def cmd_peek(args) -> int:
     """Read-only look at a tee sheet. No booking, no ledger."""
     adapter = _adapter(args)
-    prefs = config.golf_prefs()
+    prefs = _prefs(args)
     target = _target(args, adapter)
-    print(f"{target:%A %b %d %Y} — {args.backend} backend\n")
+    print(f"{target:%A %b %d %Y} — {args.backend} backend — {', '.join(prefs.courses)}\n")
     try:
         slots = adapter.search_tee_times(target)
     except Exception as exc:  # noqa: BLE001
@@ -128,11 +169,13 @@ def cmd_peek(args) -> int:
         print("  (no tee times published)")
         return 0
     qualifying = {s.id for s in golf.rank(slots, prefs)}
+    several = len(prefs.courses) > 1
     for s in sorted(slots, key=lambda s: s.tee_time):
         mark = "✓" if s.id in qualifying else " "
         price = f"${s.price_usd:.0f}" if s.price_usd else "—"
+        where = f"  {s.course}" if several else ""
         print(f"  {mark} {s.tee_time:%-I:%M %p}  {s.holes:>2}h  "
-              f"{s.spots} spot(s)  {price:>5}")
+              f"{s.spots} spot(s)  {price:>5}{where}")
     print(f"\n  {len(qualifying)} of {len(slots)} match your rules")
     return 0
 
@@ -345,11 +388,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--sold-out", action="store_true", help="fake: empty sheet")
     r.add_argument("--auth-expired", action="store_true", help="fake: dead session")
     r.add_argument("--contention", type=float, default=0.35, help="fake: snipe rate")
+    r.add_argument("--deadline", type=float, metavar="SECONDS",
+                   help="override deadline_seconds for this run")
     r.set_defaults(func=cmd_run)
 
     k = sub.add_parser("peek", help="read-only look at a tee sheet")
     k.add_argument("--date", help="YYYY-MM-DD")
     k.set_defaults(func=cmd_peek)
+
+    # One-off overrides: an ad hoc run without editing preferences.toml.
+    for p_ in (r, k):
+        p_.add_argument("--players", type=int, help="party size for this run (1-4)")
+        p_.add_argument("--holes", type=int, choices=(9, 18), help="holes for this run")
+        p_.add_argument("--window", metavar="HH:MM-HH:MM",
+                        help="tee-time window for this run, e.g. 06:00-16:00")
+        p_.add_argument("--courses", metavar="LIST",
+                        help=f"comma list of {', '.join(COURSES)} (default george-wright); "
+                             "searched together, earliest time wins")
 
     sub.add_parser("rules", help="show the server's booking window").set_defaults(
         func=cmd_rules

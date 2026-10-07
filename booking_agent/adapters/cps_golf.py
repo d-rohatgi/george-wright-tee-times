@@ -42,6 +42,17 @@ SHORT_LIVED_CLIENT_ID = "onlinereswebshortlived"
 GEORGE_WRIGHT_COURSE_ID = 2
 GEORGE_WRIGHT_SITE_ID = 2  # goes in request BODIES
 
+# Boston runs both city courses on this one CPS tenant, with the same booking
+# rule (4 days at 07:00, checked 2026-10-06). teeSheetIds are unique across the
+# tenant, so only the search filter and CheckRestrictReservation need to know
+# which course a slot is at. name -> (courseId, siteId, courseName as the API
+# reports it).
+COURSES = {
+    "george-wright": (GEORGE_WRIGHT_COURSE_ID, GEORGE_WRIGHT_SITE_ID,
+                      "George Wright Golf Course"),
+    "devine": (1, 1, "William J. Devine"),
+}
+
 # Tenant-level header values, identical on every endpoint in the capture.
 TENANT_SITE_ID = "1"
 TERMINAL_ID = "3"
@@ -86,12 +97,16 @@ class CPSGolfAdapter:
         *,
         course_id: int = GEORGE_WRIGHT_COURSE_ID,
         site_id: int = GEORGE_WRIGHT_SITE_ID,
+        also_course_ids: tuple[int, ...] = (),
         timeout: float = 10.0,
         auth=None,
         identity: Identity | None = None,
     ) -> None:
         self.course_id = course_id
         self.site_id = site_id
+        # Extra courses are searched in the SAME request (courseIds=2,1), so
+        # watching two courses costs nothing at 07:00.
+        self.course_ids = (course_id, *also_course_ids)
         self.timeout = timeout
         self.auth = auth
         self.identity = identity
@@ -135,7 +150,7 @@ class CPSGolfAdapter:
                 "searchDate": _cps_date(day),
                 "holes": 0,
                 "numberOfPlayer": 0,
-                "courseIds": self.course_id,
+                "courseIds": ",".join(str(c) for c in self.course_ids),
                 "searchTimeType": 0,
                 "transactionId": tx,
                 "teeOffTimeMin": 0,
@@ -437,12 +452,15 @@ class CPSGolfAdapter:
                 },
             )
 
+            # The slot's own course: with several courses searched at once,
+            # this tee time may not be at self.course_id.
+            raw = self._raw_slots.get(str(slot_id)) or {}
             self._post(
                 "/CheckRestrictReservation",
                 {
                     "teeSheetId": slot_key,
-                    "courseId": self.course_id,
-                    "siteId": self.site_id,
+                    "courseId": raw.get("courseId", self.course_id),
+                    "siteId": raw.get("siteId", self.site_id),
                     "classCode": "RES",
                 },
             )

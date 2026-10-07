@@ -85,7 +85,7 @@ def run(
     trace = trace or NullTrace()
     trace.event(
         "start", target=f"{target_date:%a %b %d %Y}", players=prefs.players,
-        holes=prefs.holes,
+        holes=prefs.holes, courses=list(prefs.courses),
         window=f"{prefs.no_earlier_than:%H:%M}–{prefs.no_later_than:%H:%M}",
         deadline_s=deadline_s, poll_interval_s=poll_interval_s, dry_run=dry_run,
     )
@@ -115,7 +115,7 @@ def _account_booking(adapter, target_date: date, prefs: GolfPrefs):
     """The account's existing booking for target_date at this course, if any."""
     for booking in adapter.get_existing_bookings():
         if (booking.slot.tee_time.date() == target_date
-                and booking.slot.course == prefs.course):
+                and booking.slot.course in prefs.courses):
             return booking
     return None
 
